@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Audio Call</title>
+    <style>
+        :root {
+            --primary: #4a90e2;
+            --danger: #e74c3c;
+            --success: #2ecc71;
+            --bg: #f5f7fa;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 400px;
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+
+        .btn-connect { background: var(--primary); color: white; width: 100%; }
+        .btn-call { background: var(--success); color: white; padding: 5px 15px; }
+        .btn-accept { background: var(--success); color: white; flex: 1; }
+        .btn-reject { background: var(--danger); color: white; flex: 1; }
+        .btn-hangup {
+            background: var(--danger);
+            color: white;
+            width: 100%;
+            margin-top: 15px;
+            display: none; /* Hidden by default */
+        }
+
+        #status {
+            text-align: center;
+            font-size: 0.9em;
+            color: #666;
+            margin: 15px 0;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 5px;
+        }
+
+        #user-list { list-style: none; padding: 0; }
+        #user-list li {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+        }
+
+        #incomingCall {
+            display: none;
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 350px;
+            background: white;
+            border: 2px solid var(--primary);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            z-index: 1000;
+        }
+
+        .input-group { margin-bottom: 15px; }
+        input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+
+        audio { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Audio Connect</h2>
+
+    <div id="login-section">
+        <div class="input-group">
+            <input type="text" id="username" placeholder="Enter your name">
+        </div>
+        <button class="btn btn-connect" onclick="connect()">Go Online</button>
+    </div>
+
+    <div id="status">Status: Offline</div>
+
+    <div id="call-controls">
+        <button id="hangupBtn" class="btn btn-hangup" onclick="endCall()">End Call</button>
+    </div>
+
+    <h3>Available Users</h3>
+    <ul id="user-list"></ul>
+</div>
+
+<div id="incomingCall">
+    <div style="text-align:center">
+        <strong>Incoming Call</strong>
+        <p id="callerName">...</p>
+    </div>
+    <div style="display:flex; gap:10px; margin-top:15px;">
+        <button class="btn btn-accept" onclick="acceptCall()">Accept</button>
+        <button class="btn btn-reject" onclick="rejectCall()">Decline</button>
+    </div>
+</div>
+
+<audio id="remoteAudio" autoplay></audio>
+
+<script>
+    let ws;
+    let localStream;
+    let peerConnection;
+    let myUsername;
+    let targetUser;
+    let incomingOfferData = null;
+    let isBusy = false; // Prevents multiple calls
+
+    const rtcConfig = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    };
+
+    function connect() {
+        myUsername = document.getElementById("username").value;
+        if (!myUsername) return alert("Enter a name");
+
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        ws = new WebSocket(`${protocol}${window.location.host}/signal`);
+
+        ws.onopen = () => {
+            ws.send(JSON.stringify({ type: "login", username: myUsername }));
+            document.getElementById("login-section").style.display = "none";
+            updateStatus("Online as " + myUsername);
+        };
+
+        ws.onmessage = async (msg) => {
+            const data = JSON.parse(msg.data);
+
+            // If busy and receiving an offer, notify sender (optional) or just ignore
+            if (isBusy && data.type === "offer") {
+                console.log("Busy, ignoring call from " + data.username);
+                return;
+            }
+
+            switch(data.type) {
+                case "user-list": renderUserList(data.users); break;
+                case "offer": handleIncomingOffer(data); break;
+                case "answer": handleAnswer(data); break;
+                case "candidate": handleCandidate(data); break;
+                case "end-call": endCall(false); break; // Received hangup from other side
+            }
+        };
+    }
+
+    async function setupLocalAudio() {
+        try {
+            if (localStream) return true;
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            return true;
+        } catch (err) {
+            updateStatus("Mic Error: Needs HTTPS");
+            return false;
+        }
+    }
+
+    async function callUser(user) {
+        if (isBusy) return;
+        targetUser = user;
+        isBusy = true;
+
+        const success = await setupLocalAudio();
+        if (!success) { isBusy = false; return; }
+
+        initPeerConnection();
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+
+        ws.send(JSON.stringify({ type: "offer", target: targetUser, offer: offer }));
+        updateStatus("Calling " + user + "...");
+        document.getElementById("hangupBtn").style.display = "block";
+    }
+
+    function handleIncomingOffer(data) {
+        incomingOfferData = data.offer;
+        targetUser = data.username;
+        document.getElementById("callerName").innerText = targetUser;
+        document.getElementById("incomingCall").style.display = "block";
+    }
+
+    async function acceptCall() {
+        isBusy = true;
+        document.getElementById("incomingCall").style.display = "none";
+
+        const success = await setupLocalAudio();
+        if (!success) { endCall(); return; }
+
+        initPeerConnection();
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(incomingOfferData));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        ws.send(JSON.stringify({ type: "answer", target: targetUser, answer: answer }));
+        updateStatus("In call with " + targetUser);
+        document.getElementById("hangupBtn").style.display = "block";
+    }
+
+    async function handleAnswer(data) {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+        updateStatus("In call with " + targetUser);
+    }
+
+    async function handleCandidate(data) {
+        if (peerConnection) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+    }
+
+    function initPeerConnection() {
+        peerConnection = new RTCPeerConnection(rtcConfig);
+        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                ws.send(JSON.stringify({ type: "candidate", target: targetUser, candidate: event.candidate }));
+            }
+        };
+
+        peerConnection.ontrack = (event) => {
+            document.getElementById("remoteAudio").srcObject = event.streams[0];
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+            if (peerConnection.connectionState === "disconnected" || peerConnection.connectionState === "failed") {
+                endCall(false);
+            }
+        };
+    }
+
+    function endCall(notifyRemote = true) {
+        // 1. Tell other user we hung up
+        if (notifyRemote && ws && targetUser) {
+            ws.send(JSON.stringify({ type: "end-call", target: targetUser }));
+        }
+
+        // 2. Stop PeerConnection
+        if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+
+        // 3. Stop Microphone
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        }
+
+        // 4. Reset UI
+        isBusy = false;
+        targetUser = null;
+        incomingOfferData = null;
+        document.getElementById("hangupBtn").style.display = "none";
+        document.getElementById("incomingCall").style.display = "none";
+        updateStatus("Call ended. Online.");
+    }
+
+    function rejectCall() {
+        document.getElementById("incomingCall").style.display = "none";
+        ws.send(JSON.stringify({ type: "end-call", target: targetUser })); // Tell them no
+        isBusy = false;
+        updateStatus("Call declined.");
+    }
+
+    function renderUserList(users) {
+        const list = document.getElementById("user-list");
+        list.innerHTML = "";
+        users.forEach(u => {
+            if (u === myUsername) return;
+            const li = document.createElement("li");
+            li.innerHTML = `<span>${u}</span> <button class="btn btn-call" onclick="callUser('${u}')">Call</button>`;
+            list.appendChild(li);
+        });
+    }
+
+    function updateStatus(msg) {
+        document.getElementById("status").innerText = "Status: " + msg;
+    }
+</script>
+</body>
+</html>
